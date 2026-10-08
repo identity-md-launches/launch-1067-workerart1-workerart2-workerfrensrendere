@@ -35,13 +35,18 @@ abstract contract FrensReviewBase is Test {
     bytes internal constant DEPLOYER_CODE =
         hex"7fffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffe03601600081602082378035828234f58015156039578182fd5b8082525050506014600cf3";
 
+    /// @dev The two launches in order: the collection (PlaceFrens, PlaceModules), then the art (WorkerArt1, WorkerArt2,
+    ///      WorkerFrensRenderer over them)
     function _launch(FrensReviewFactory factory) internal returns (PlaceFrens pf, PlaceModules pm) {
         pf = PlaceFrens(_deploy(factory, "FrensPlacement.sol:PlaceFrens", "", 1));
-        address art1 = _deploy(factory, "WorkerArt.sol:WorkerArt1", "", 2);
-        address art2 = _deploy(factory, "WorkerArt.sol:WorkerArt2", "", 3);
-        pm = PlaceModules(_deploy(factory, "FrensPlacement.sol:PlaceModules", abi.encode(address(pf), art1, art2), 4));
-        assertEq(WorkerFrensRenderer(pm.renderer()).art1(), art1);
-        assertEq(WorkerFrensRenderer(pm.renderer()).art2(), art2);
+        pm = PlaceModules(_deploy(factory, "FrensPlacement.sol:PlaceModules", abi.encode(address(pf)), 2));
+        address art1 = _deploy(factory, "WorkerArt.sol:WorkerArt1", "", 3);
+        address art2 = _deploy(factory, "WorkerArt.sol:WorkerArt2", "", 4);
+        WorkerFrensRenderer r = WorkerFrensRenderer(
+            _deploy(factory, "WorkerFrensRenderer.sol:WorkerFrensRenderer", abi.encode(art1, art2), 5)
+        );
+        assertEq(r.art1(), art1);
+        assertEq(r.art2(), art2);
     }
 
     function _deploy(FrensReviewFactory factory, string memory artifact, bytes memory args, uint256 salt)
@@ -73,7 +78,7 @@ abstract contract FrensReviewBase is Test {
 }
 
 contract FrensFactoryReviewTest is FrensReviewBase {
-    function test_ProtectedFactoryDeploysAllFourInOrder() public {
+    function test_ProtectedFactoryDeploysBothLaunchesInOrder() public {
         vm.etch(FrensPlan.CREATE2_DEPLOYER, DEPLOYER_CODE);
         FrensReviewFactory factory = new FrensReviewFactory();
         (PlaceFrens pf, PlaceModules pm) = _launch(factory);
@@ -127,7 +132,7 @@ contract FrensFactoryReviewTest is FrensReviewBase {
                 assertTrue(found, "called an account not created in this launch");
             }
         }
-        assertEq(count, 10, "four applications and six nested contracts");
+        assertEq(count, 10, "five applications and five nested contracts");
         assertNotEq(pf.frens(), FrensPlan.FRENS_AT);
         assertNotEq(pm.swapper(), FrensPlan.SWAPPER_AT);
         _checkDependencies(pf, pm);
@@ -381,7 +386,7 @@ contract FrensAuditReviewTest is FrensReviewBase, FrensRules {
         pool.setPrice(uint160((uint256(1) << 96) / 265)); // the price is back: about 70,225
         vm.roll(vm.getBlockNumber() + 1);
         assertGt(placed.spotRate(), 100 * placed.floorRate(), "the pre-placed swapper values IMD6900 100x off");
-        PlaceModules pm = new PlaceModules(pf, address(new WorkerArt1()), address(new WorkerArt2()));
+        PlaceModules pm = new PlaceModules(pf);
         FrenSwapper own = FrenSwapper(payable(pm.swapper()));
         assertTrue(address(own) != FrensPlan.SWAPPER_AT, "not the skewed one");
         assertEq(address(own), vm.computeCreateAddress(address(pm), 1), "the launch's own, from PlaceModules itself");
@@ -408,7 +413,7 @@ contract FrensAuditReviewTest is FrensReviewBase, FrensRules {
         assertApproxEqAbs(seeded, 70_225e18, 1e18);
         pool.setPrice(uint160((uint256(1) << 96) / 200)); // drifted since: 40,000, within 2x
         vm.roll(vm.getBlockNumber() + 1);
-        PlaceModules pm = new PlaceModules(pf, address(new WorkerArt1()), address(new WorkerArt2()));
+        PlaceModules pm = new PlaceModules(pf);
         assertEq(pm.swapper(), address(placed));
         assertEq(placed.rateAverage(), seeded);
         assertEq(placed.spotRate(), 40_000e18);
@@ -417,7 +422,7 @@ contract FrensAuditReviewTest is FrensReviewBase, FrensRules {
     /// @dev The swapper the launch creates itself starts at the pool's price of its own block: always within the band
     function test_Fix_LaunchsOwnSwapperStartsAtThePoolsPrice() public {
         _skewedPool(uint160((uint256(1) << 96) / 265));
-        PlaceModules pm = new PlaceModules(pf, address(new WorkerArt1()), address(new WorkerArt2()));
+        PlaceModules pm = new PlaceModules(pf);
         FrenSwapper s = FrenSwapper(payable(pm.swapper()));
         assertEq(address(s), FrensPlan.SWAPPER_AT);
         assertEq(s.averagedAt(), vm.getBlockNumber());
@@ -425,19 +430,20 @@ contract FrensAuditReviewTest is FrensReviewBase, FrensRules {
         assertEq(s.floorRate(), s.spotRate());
     }
 
-    /// @dev Review 301734e0, fixed in the launch: the renderer draws only the exact chunks WorkerArtIndex was generated
-    ///      from; PlaceModules refuses any other art (the two the other way round included) instead of placing a
-    ///      renderer that draws nothing
+    /// @dev Review 301734e0, fixed in the art launch: the renderer draws only the exact chunks WorkerArtIndex was
+    ///      generated from, and its constructor refuses any other art (the two the other way round included) instead of
+    ///      deploying a renderer that draws nothing
     function test_Fix_LaunchRefusesTheWrongArt() public {
         address a1 = address(new WorkerArt1());
         address a2 = address(new WorkerArt2());
-        vm.expectRevert(Placer.PlaceFailed.selector);
-        new PlaceModules(pf, a2, a1);
-        vm.expectRevert(Placer.PlaceFailed.selector);
-        new PlaceModules(pf, a1, address(pf));
-        vm.expectRevert(Placer.PlaceFailed.selector);
-        new PlaceModules(pf, a1, makeAddr("no code"));
-        PlaceModules pm = new PlaceModules(pf, a1, a2);
-        assertEq(WorkerFrensRenderer(pm.renderer()).art1(), a1);
+        address[2][3] memory wrong = [[a2, a1], [a1, address(pf)], [a1, makeAddr("no code")]];
+        for (uint256 i; i < wrong.length; ++i) {
+            try new WorkerFrensRenderer(wrong[i][0], wrong[i][1]) {
+                assertTrue(false, "the wrong art");
+            } catch (bytes memory err) {
+                assertEq(bytes4(err), WorkerFrensRenderer.BadArt.selector);
+            }
+        }
+        assertEq(new WorkerFrensRenderer(a1, a2).art1(), a1);
     }
 }

@@ -18,19 +18,19 @@ interface IPlacedModules {
     function swapper() external view returns (address);
     function minter() external view returns (address);
     function gate() external view returns (address);
-    function renderer() external view returns (address);
 }
 
 interface IStrategyMin {
     function isDistributor(address) external view returns (bool);
 }
 
-/// @notice The frens after the IMD swarm has deployed them (src/FrensPlacement.sol, at FrensPlan's addresses): the team
-///         wallet (owner and governor) wires them, points them at the launch's renderer, mints the curve's first frens
-///         to IMD6900 and hands the governor to the timelock. Every call is the team wallet's. The other tests deploy
-///         the same contracts with plain `new` ({deploy}).
-///   MODULES=<the launch's PlaceModules> forge script script/frens/DeployFrens.s.sol --sig "setup()" --rpc-url … \
-///     --account imdstr-deployer --broadcast
+/// @notice The frens after the IMD swarm's two launches (the collection: src/FrensPlacement.sol, at FrensPlan's
+///         addresses; the art: WorkerArt1, WorkerArt2 and WorkerFrensRenderer): the team wallet (owner and governor)
+///         wires them, points them at the art launch's renderer, mints the curve's first frens to IMD6900 and hands the
+///         governor to the timelock. Every call is the team wallet's. The other tests deploy the same contracts with
+///         plain `new` ({deploy}).
+///   MODULES=<the collection launch's PlaceModules> RENDERER=<the art launch's WorkerFrensRenderer> \
+///     forge script script/frens/DeployFrens.s.sol --sig "setup()" --rpc-url … --account imdstr-deployer --broadcast
 contract DeployFrens is Script {
     address public constant IMD = 0xD34a99Bc0f67aE1bbd63C660e6d0b0dd03E263B7;
     address public constant IMD6900 = 0x0000198C940D8cD70Cb9ACeC5E3af8216ac57d2F;
@@ -54,17 +54,16 @@ contract DeployFrens is Script {
         FrenWorkerGate gate;
     }
 
-    /// @notice After the swarm's launch, from the team wallet (the frens' owner and governor): the launch's renderer,
-    ///         the swapper and the workers' window, the launch's trait rules, sealed. Reads where the launch put them:
-    ///         the renderer from its PlaceModules (MODULES in the env), or RENDERER. Until the Ethereum timelock's batch
+    /// @notice After the swarm's launches, from the team wallet (the frens' owner and governor): the art launch's
+    ///         renderer (RENDERER in the env), the swapper and the workers' window, the launch's trait rules, sealed. Reads
+    ///         where the collection launch put them (MODULES in the env: its PlaceModules). Until the Ethereum timelock's batch
     ///         makes the frens an IMD6900 distributor, the floor's buys are paused (the floor waits in $IMD): IMD6900
     ///         bought before that could never be paid out, and every recycle and treasury buy would fail on it. {resume}
     ///         turns the buys back on once the batch has landed.
     function setup() external {
         (address frens, address swapper,, address gate) = placed();
-        address renderer = vm.envOr("RENDERER", address(0));
-        if (renderer == address(0)) renderer = IPlacedModules(vm.envAddress("MODULES")).renderer();
-        require(renderer.code.length != 0, "no renderer placed");
+        address renderer = vm.envAddress("RENDERER");
+        require(renderer.code.length != 0, "no renderer at RENDERER");
         IMD6900Frens f = IMD6900Frens(payable(frens));
         bool paused = !IStrategyMin(IMD6900).isDistributor(frens);
         vm.startBroadcast(DEPLOYER);

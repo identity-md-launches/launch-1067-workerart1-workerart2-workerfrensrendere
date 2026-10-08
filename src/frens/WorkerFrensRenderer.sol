@@ -18,8 +18,8 @@ import {WorkerArtIndex as Art} from "../art/WorkerArtIndex.sol";
 ///  for byte is export_v3.py in the art kit: its renders' hashes are script/art/data/expected.json.
 /// @dev Layer format: x0 y0 w h, then per row (count, index) runs over w pixels; index 0 is see-through.
 ///      A combo (24 bits): character 0-1 | face 2-5 | eye 6-7 | coat 8-9 | shirt 10-12 | hat 13-14 | background 15-18 |
-///      item 19-22. The constructor only stores the two new chunks' addresses, so it deploys anywhere (IMD's admission
-///      runs a launch on a fresh chain first).
+///      item 19-22. The constructor checks the two new chunks' code hashes and stores their addresses: it calls
+///      nothing, so it deploys anywhere the chunks are (IMD's admission runs a launch on a fresh chain first).
 contract WorkerFrensRenderer {
     using Strings for uint256;
 
@@ -42,7 +42,14 @@ contract WorkerFrensRenderer {
     error Missing();
     error BadArt();
 
+    /// @dev The art launch passes the two chunks it created just before this (`$contract:WorkerArt1`,
+    ///      `$contract:WorkerArt2`). They must be the exact code WorkerArtIndex was generated from, or this would draw
+    ///      nothing (BadArt). Only their code hashes are read (no call), so it deploys on a fresh chain all the same.
     constructor(address art1_, address art2_) {
+        bytes memory hashes = Art.CHUNK_HASHES;
+        if (art1_.codehash != bytes32(_hex(hashes, 7 * 64, 64)) || art2_.codehash != bytes32(_hex(hashes, 8 * 64, 64))) {
+            revert BadArt();
+        }
         (art1, art2) = (art1_, art2_);
     }
 

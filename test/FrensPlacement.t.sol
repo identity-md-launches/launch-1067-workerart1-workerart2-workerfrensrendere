@@ -42,23 +42,32 @@ interface IHookFees {
     function feeAddress() external view returns (address);
 }
 
-interface IFeeExempt {
-    function feeExempt(address) external view returns (bool);
-}
 
-/// @dev What IMD's launch does with `evm_contracts`: the contracts in order from its own deployer, constructors only,
-///      a later one given earlier ones' addresses (`$contract:PlaceFrens`, `$contract:WorkerArt1`, …), nothing called after
+/// @dev What IMD's `evm_contracts` launches do: each launch's contracts in order from IMD's deployer, in one
+///      transaction, constructors only, a later one given an earlier one's address (`$contract:…`), nothing called
+///      after. Two launches: the collection (PlaceFrens, PlaceModules), then the art (WorkerArt1, WorkerArt2,
+///      WorkerFrensRenderer over them).
 contract ImdStyleDeployer {
     PlaceFrens public placeFrens;
+    PlaceModules public placeModules;
     address public art1;
     address public art2;
-    PlaceModules public placeModules;
+    address public renderer;
 
     function launch() external {
+        launchCollection();
+        launchArt();
+    }
+
+    function launchCollection() public {
         placeFrens = new PlaceFrens();
+        placeModules = new PlaceModules(placeFrens);
+    }
+
+    function launchArt() public {
         art1 = address(new WorkerArt1());
         art2 = address(new WorkerArt2());
-        placeModules = new PlaceModules(placeFrens, art1, art2);
+        renderer = address(new WorkerFrensRenderer(art1, art2));
     }
 }
 
@@ -130,9 +139,6 @@ contract FrensPlacementTest is Test {
         assertEq(keccak256(FrensCode.SWAPPER), keccak256(type(FrenSwapper).creationCode), "FrenSwapper");
         assertEq(keccak256(FrensCode.MINTER), keccak256(type(FrenMinter).creationCode), "FrenMinter");
         assertEq(keccak256(FrensCode.GATE), keccak256(type(FrenWorkerGate).creationCode), "FrenWorkerGate");
-        assertEq(
-            keccak256(FrensCode.RENDERER), keccak256(type(WorkerFrensRenderer).creationCode), "WorkerFrensRenderer"
-        );
     }
 
     function test_PlanFollowsFromTheCode() public pure {
@@ -208,9 +214,9 @@ contract FrensPlacementTest is Test {
         assertEq(pm.swapper(), FrensPlan.SWAPPER_AT);
         assertEq(pm.minter(), FrensPlan.MINTER_AT);
         assertEq(pm.gate(), FrensPlan.GATE_AT);
-        // the renderer: where the art chunks the launch deployed put it
-        bytes memory rendererInit = abi.encodePacked(FrensCode.RENDERER, abi.encode(d.art1(), d.art2()));
-        assertEq(pm.renderer(), _create2(FrensPlan.RENDERER_SALT, rendererInit), "renderer");
+        // the art launch's renderer, over its own two chunks
+        assertEq(WorkerFrensRenderer(d.renderer()).art1(), d.art1(), "the renderer's chunks");
+        assertEq(WorkerFrensRenderer(d.renderer()).art2(), d.art2());
         _checkWiring(pf, pm);
     }
 
@@ -275,8 +281,6 @@ contract FrensPlacementTest is Test {
         assertEq(FrenMinter(payable(pm.minter())).imd(), FrensPlan.IMD);
         assertEq(FrenWorkerGate(pm.gate()).frens(), address(f));
         assertEq(IOwned(pm.gate()).owner(), FrensPlan.OWNER);
-        assertGt(WorkerFrensRenderer(pm.renderer()).art1().code.length, 0, "the art chunks");
-        assertGt(WorkerFrensRenderer(pm.renderer()).art2().code.length, 0);
         assertEq(f.name(), "Worker Frens");
         assertEq(f.symbol(), "wFREN");
         assertEq(
@@ -289,37 +293,49 @@ contract FrensPlacementTest is Test {
 
     /* ── IMD's limits ───────────────────────────────────────────── */
 
-    /// @dev Each of the launch's four contracts: initcode within EIP-3860, its creation within EIP-7825's 2^24 gas (with
-    ///      a creation transaction's own cost on top: 21,000, 32,000, and its calldata at EIP-7623's floor, 40 a byte)
-    function test_FitsOneTransaction() public {
-        bytes[4] memory init = [
-            type(PlaceFrens).creationCode,
-            type(WorkerArt1).creationCode,
-            type(WorkerArt2).creationCode,
-            abi.encodePacked(type(PlaceModules).creationCode, abi.encode(address(1), address(2), address(3)))
-        ];
-        string[4] memory names = ["PlaceFrens", "WorkerArt1", "WorkerArt2", "PlaceModules"];
-        uint256[4] memory used;
+    /// @dev IMD's launcher creates all of a launch's contracts in one transaction, so each launch must fit EIP-7825's 2^24
+    ///      gas whole: 21,000, its calldata (the creation codes, at EIP-7623's rates), every creation, and the launcher's
+    ///      own work on top. Two earlier launches through the same launcher (0xff03410d…) cost it 652,377 gas for 57,604
+    ///      bytes of input and 774,084 for 76,100 (receipts less creations and calldata); 300,000 + 7 a byte prices it
+    ///      above both. Each launch must also leave MARGIN to spare. Each contract's initcode stays within EIP-3860.
+    function test_EachLaunchFitsOneTransaction() public {
+        bytes[] memory collection = new bytes[](2);
+        collection[0] = type(PlaceFrens).creationCode;
+        collection[1] = abi.encodePacked(type(PlaceModules).creationCode, abi.encode(address(1)));
+        bytes[] memory art = new bytes[](3);
+        art[0] = type(WorkerArt1).creationCode;
+        art[1] = type(WorkerArt2).creationCode;
+        art[2] = abi.encodePacked(type(WorkerFrensRenderer).creationCode, abi.encode(address(1), address(2)));
+        for (uint256 i; i < collection.length; ++i) assertLt(collection[i].length, INITCODE_CAP, "a collection contract");
+        for (uint256 i; i < art.length; ++i) assertLt(art[i].length, INITCODE_CAP, "an art contract");
+
+        ImdStyleDeployer d = new ImdStyleDeployer();
         uint256 g = gasleft();
-        PlaceFrens pf = new PlaceFrens();
-        used[0] = g - gasleft();
+        d.launchCollection();
+        uint256 collectionGas = _launchTx(g - gasleft(), collection);
         g = gasleft();
-        address a1 = address(new WorkerArt1());
-        used[1] = g - gasleft();
-        g = gasleft();
-        address a2 = address(new WorkerArt2());
-        used[2] = g - gasleft();
-        g = gasleft();
-        new PlaceModules(pf, a1, a2);
-        used[3] = g - gasleft();
-        for (uint256 i; i < 4; ++i) {
-            uint256 txGas = used[i] + 53_000 + 40 * init[i].length;
-            emit log_named_uint(string.concat(names[i], ": initcode bytes"), init[i].length);
-            emit log_named_uint(string.concat(names[i], ": gas"), txGas);
-            assertLt(init[i].length, INITCODE_CAP, names[i]);
-            assertLt(txGas, TX_GAS_CAP, names[i]);
+        d.launchArt();
+        uint256 artGas = _launchTx(g - gasleft(), art);
+        emit log_named_uint("the collection launch: gas, all in", collectionGas);
+        emit log_named_uint("the art launch: gas, all in", artGas);
+        assertLt(collectionGas + MARGIN, TX_GAS_CAP, "the collection launch in one transaction, with margin");
+        assertLt(artGas + MARGIN, TX_GAS_CAP, "the art launch in one transaction, with margin");
+        assertEq(d.art1().code.length, 23_332, "the first chunk: a STOP, then its art in 707 frames of 33 bytes");
+    }
+
+    uint256 constant MARGIN = 1_000_000;
+
+    /// @dev A launch transaction's gas: its creations, plus 21,000, its calldata and the launcher's overhead
+    function _launchTx(uint256 creations, bytes[] memory codes) internal pure returns (uint256) {
+        uint256 bytes_;
+        uint256 tokens;
+        for (uint256 i; i < codes.length; ++i) {
+            bytes_ += codes[i].length;
+            for (uint256 k; k < codes[i].length; ++k) tokens += codes[i][k] == 0 ? 1 : 4;
         }
-        assertEq(a1.code.length, 23_332, "the first chunk: a STOP, then its art in 707 frames of 33 bytes");
+        uint256 standard = 21_000 + 4 * tokens + creations + 300_000 + 7 * bytes_; // the launcher: 300,000 + 7 a byte
+        uint256 floor = 21_000 + 10 * tokens; // EIP-7623
+        return standard > floor ? standard : floor;
     }
 
     function test_PassesTheAdmissionScan() public {
@@ -337,8 +353,8 @@ contract FrensPlacementTest is Test {
         _scan(pm.swapper().code, "FrenSwapper");
         _scan(pm.minter().code, "FrenMinter");
         _scan(pm.gate().code, "FrenWorkerGate");
-        _scan(pm.renderer().code, "WorkerFrensRenderer");
-        _scan(FrensCode.RENDERER, "WorkerFrensRenderer creation code");
+        _scan(d.renderer().code, "WorkerFrensRenderer");
+        _scan(type(WorkerFrensRenderer).creationCode, "WorkerFrensRenderer creation code");
         _scan(FrensCode.PRICES, "FrenPrices creation code");
         _scan(FrensCode.FRENS, "IMD6900Frens creation code");
         _scan(FrensCode.SWAPPER, "FrenSwapper creation code");
@@ -393,7 +409,10 @@ contract FrensPlacementTest is Test {
 
     /// @dev Other code at a chunk's address draws nothing: every read checks the chunk's code hash
     function test_RefusesOtherArt() public {
-        RendererProbe r = new RendererProbe(address(new WorkerArt2()), address(new WorkerArt1())); // swapped
+        address a1 = address(new WorkerArt1());
+        address a2 = address(new WorkerArt2());
+        RendererProbe r = new RendererProbe(a1, a2);
+        vm.etch(a1, a2.code); // the chunk's code changed under it (no chunk can: a test can)
         vm.expectRevert(WorkerFrensRenderer.BadArt.selector);
         r.entry(WorkerArtIndex.COAT);
         vm.expectRevert(WorkerFrensRenderer.BadArt.selector);
@@ -401,7 +420,7 @@ contract FrensPlacementTest is Test {
     }
 
     function test_Attributes() public {
-        WorkerFrensRenderer r = new WorkerFrensRenderer(address(1), address(2));
+        WorkerFrensRenderer r = new WorkerFrensRenderer(address(new WorkerArt1()), address(new WorkerArt2()));
         // pepe, Laser Eyes, Gold lens, Gold coat, Purple shirt, Bobo Hat, Wireframe Red, Bunsen Burner
         uint24 combo = uint24(0 | 12 << 2 | 3 << 6 | 2 << 8 | 5 << 10 | 2 << 13 | 11 << 15 | 15 << 19);
         assertEq(
@@ -453,6 +472,7 @@ contract FrensPlacementForkTest is Test, FrensRules {
     DeployFrens s;
     PlaceFrens pf;
     PlaceModules pm;
+    address renderer; // the art launch's
     IMD6900Frens frens;
     FrenMinter minter;
     FrenWorkerGate gate;
@@ -467,8 +487,9 @@ contract FrensPlacementForkTest is Test, FrensRules {
         s = new DeployFrens();
         ImdStyleDeployer d = new ImdStyleDeployer();
         d.launch();
-        (pf, pm) = (d.placeFrens(), d.placeModules());
+        (pf, pm, renderer) = (d.placeFrens(), d.placeModules(), d.renderer());
         vm.setEnv("MODULES", vm.toString(address(pm)));
+        vm.setEnv("RENDERER", vm.toString(renderer));
         frens = IMD6900Frens(payable(pf.frens()));
         minter = FrenMinter(payable(pm.minter()));
         gate = FrenWorkerGate(pm.gate());
@@ -487,7 +508,7 @@ contract FrensPlacementForkTest is Test, FrensRules {
     /// @dev The art kit's reference renders (export_v3.py: script/art/data/expected.json), byte for byte: revealed frens
     ///      over every background kind, both new and swarm layers, and unrevealed cards
     function test_fork_DrawsLikeTheReference() public {
-        WorkerFrensRenderer r = WorkerFrensRenderer(pm.renderer());
+        WorkerFrensRenderer r = WorkerFrensRenderer(renderer);
         string memory j = vm.readFile("script/art/data/expected.json");
         for (uint256 i; i < 7; ++i) {
             string memory k = string.concat(".revealed[", vm.toString(i), "]");
@@ -516,7 +537,7 @@ contract FrensPlacementForkTest is Test, FrensRules {
 
     /// @dev Every background, every character, every item draws (each layer's chunk is the one the index names)
     function test_fork_DrawsEveryLayer() public view {
-        WorkerFrensRenderer r = WorkerFrensRenderer(pm.renderer());
+        WorkerFrensRenderer r = WorkerFrensRenderer(renderer);
         for (uint256 i; i < 16; ++i) {
             uint24 combo = uint24(
                 (i % 3) | (i % 13) << 2 | (i % 4) << 6 | (i % 3) << 8 | (i % 6) << 10 | (i % 12) << 15 | i << 19
@@ -531,7 +552,7 @@ contract FrensPlacementForkTest is Test, FrensRules {
 
     function test_fork_SetupDrawsWithTheLaunchsArt() public {
         s.setup();
-        assertEq(frens.renderer(), pm.renderer());
+        assertEq(frens.renderer(), renderer);
         assertEq(frens.swapper(), pm.swapper());
         assertEq(frens.workerGate(), address(gate));
         assertTrue(frens.traitsSealed());
@@ -582,7 +603,7 @@ contract FrensPlacementForkTest is Test, FrensRules {
         assertGt(frens.floorImd(), 0, "the floor waits in $IMD");
 
         // an unrevealed fren: the card, under the new name, no IMD in the words
-        WorkerFrensRenderer art = WorkerFrensRenderer(pm.renderer());
+        WorkerFrensRenderer art = WorkerFrensRenderer(renderer);
         _checkMeta(frens.tokenURI(1), "Worker Fren #1", _image(art.pendingURI(1)));
 
         // the opening: the workers' window, then the public, who pay in ETH
@@ -643,60 +664,6 @@ contract FrensPlacementForkTest is Test, FrensRules {
         assertEq(frens.owner(), OWNER);
     }
 
-    /// @dev The opening as it will run. The batch is queued with the addresses fixed ahead (here after the launch, the
-    ///      same call), the team wallet sets up, mints the curve's first frens to IMD6900 and hands the governor over;
-    ///      48h later the real TimelockController runs the batch: IMD6900 whitelists the frens, the swapper trades
-    ///      fee-free, the launch hook's fees come here, and the mint opens with the floor already buying IMD6900.
-    function test_fork_TheTimelockOpensTheMint() public {
-        FrensTimelockBatch b = new FrensTimelockBatch();
-        (address[] memory targets, uint256[] memory values, bytes[] memory datas) =
-            b.batch(FrensPlan.FRENS_AT, FrensPlan.SWAPPER_AT, true, true);
-        assertEq(targets.length, 4);
-        assertEq(targets[3], address(frens), "the last call opens these frens");
-        ITimelockController tl = ITimelockController(b.TIMELOCK());
-        uint256 delay = tl.getMinDelay();
-        assertEq(delay, 48 hours);
-        bytes32 salt = b.SALT();
-        vm.prank(OWNER); // a proposer
-        tl.scheduleBatch(targets, values, datas, bytes32(0), salt, delay);
-        bytes32 id = tl.hashOperationBatch(targets, values, datas, bytes32(0), salt);
-
-        // the team wallet: setup, the curve's first frens, the governor to the timelock
-        s.setup();
-        s.firstFrens(frens, minter, 6, 0.05 ether);
-        assertEq(frens.balanceOf(s.IMD6900()), 6);
-        s.handover(frens);
-        assertEq(frens.governor(), address(tl));
-        assertFalse(frens.mintOpen());
-
-        vm.warp(block.timestamp + delay - 1);
-        assertFalse(tl.isOperationReady(id), "not before 48h");
-        vm.prank(OWNER);
-        vm.expectRevert();
-        tl.executeBatch(targets, values, datas, bytes32(0), salt);
-        vm.warp(block.timestamp + 1);
-        assertTrue(tl.isOperationReady(id));
-        vm.prank(OWNER); // an executor
-        tl.executeBatch(targets, values, datas, bytes32(0), salt);
-
-        assertTrue(frens.mintOpen(), "open");
-        assertTrue(ITransferRule(s.IMD6900()).isDistributor(address(frens)), "an IMD6900 distributor");
-        assertTrue(IFeeExempt(b.PAIR_HOOK()).feeExempt(pm.swapper()), "the swapper trades fee-free");
-        assertEq(IHookFees(b.HOOK()).feeAddress(), address(frens), "the launch hook's fees come here");
-
-        // the first public minter (the gate's owner ends the workers' window here), the floor in IMD6900
-        vm.prank(OWNER);
-        gate.openPublic();
-        address buyer = makeAddr("a first minter");
-        vm.deal(buyer, 1 ether);
-        uint256 cost = frens.quote(1);
-        (uint256 ethIn,) = minter.quoteEth(1);
-        vm.prank(buyer);
-        minter.mintWithEth{value: ethIn * 102 / 100}(1, cost);
-        assertEq(frens.balanceOf(buyer), 1);
-        assertGt(frens.reserve(), 0, "the floor in IMD6900");
-    }
-
     /// @dev Workers first, the public after the batch: the team wallet (still the governor) opens the workers' and WL's
     ///      window as soon as the launch is set up, with floor buys paused so the floor waits in $IMD; 48h later the
     ///      batch lands without touching the mint (no governor needed), buys come back on, the public opens, and the
@@ -711,12 +678,12 @@ contract FrensPlacementForkTest is Test, FrensRules {
         vm.prank(OWNER);
         tl.scheduleBatch(targets, values, datas, bytes32(0), salt, 48 hours);
 
-        // day one: setup, the WL, floor buys paused, the window open
+        // day one: setup (it pauses the floor's buys until the batch), the WL, the window open
         address wl = makeAddr("a WL wallet");
         s.setup();
+        assertEq(frens.maxImdPerBuy(), 0, "floor buys paused");
         vm.startPrank(OWNER);
         gate.setWlRoot(keccak256(bytes.concat(keccak256(abi.encode(wl, uint256(2)))))); // a one-wallet list: root = leaf
-        frens.setParams(1, 0, 0);
         frens.setMintOpen(true);
         vm.stopPrank();
 
@@ -747,10 +714,9 @@ contract FrensPlacementForkTest is Test, FrensRules {
         tl.executeBatch(targets, values, datas, bytes32(0), salt);
         assertTrue(ITransferRule(s.IMD6900()).isDistributor(address(frens)), "an IMD6900 distributor");
         assertEq(IHookFees(b.HOOK()).feeAddress(), address(frens), "the launch hook's fees come here");
-        vm.startPrank(OWNER);
-        frens.setParams(1, 50e18, 0.25 ether);
+        s.resume();
+        vm.prank(OWNER);
         gate.openPublic();
-        vm.stopPrank();
         vm.roll(block.number + 2);
         frens.buyFloor(0);
         assertGt(frens.reserve(), 0, "the waiting $IMD now IMD6900");

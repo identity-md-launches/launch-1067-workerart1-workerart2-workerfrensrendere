@@ -49,18 +49,21 @@ contract FakePlaced {
     }
 }
 
-/// @dev What IMD's launch does, from its own deployer, so the launch's actors are all known to the tests
+/// @dev What IMD's two launches do, from its own deployer, so the launches' actors are all known to the tests: the
+///      collection (PlaceFrens, PlaceModules), then the art (WorkerArt1, WorkerArt2, WorkerFrensRenderer)
 contract LaunchRunner {
     PlaceFrens public placeFrens;
+    PlaceModules public placeModules;
     address public art1;
     address public art2;
-    PlaceModules public placeModules;
+    address public renderer;
 
     function launch() external {
         placeFrens = new PlaceFrens();
+        placeModules = new PlaceModules(placeFrens);
         art1 = address(new WorkerArt1());
         art2 = address(new WorkerArt2());
-        placeModules = new PlaceModules(placeFrens, art1, art2);
+        renderer = address(new WorkerFrensRenderer(art1, art2));
     }
 }
 
@@ -126,13 +129,11 @@ contract FrensLaunchFailuresTest is Test, FrensRules {
 
     /// @dev The modules refuse frens that aren't a collection (nothing at the address the placer names)
     function test_ModulesNeedTheCollection() public {
-        address a1 = address(new WorkerArt1());
-        address a2 = address(new WorkerArt2());
         PlaceFrens fake = PlaceFrens(address(new FakePlaced()));
         vm.expectRevert();
-        new PlaceModules(fake, a1, a2);
+        new PlaceModules(fake);
         vm.expectRevert();
-        new PlaceModules(PlaceFrens(address(0xdead)), a1, a2);
+        new PlaceModules(PlaceFrens(address(0xdead)));
         assertEq(FrensPlan.SWAPPER_AT.code.length, 0, "a failed launch places nothing");
     }
 
@@ -142,15 +143,16 @@ contract FrensLaunchFailuresTest is Test, FrensRules {
     function test_ModulesFailOverCorruptedFrens() public {
         PlaceFrens pf = new PlaceFrens();
         vm.etch(pf.frens(), address(new SilentDeployer()).code);
-        vm.expectRevert();
-        new PlaceModules(pf, address(new WorkerArt1()), address(new WorkerArt2()));
+        // try, not vm.expectRevert over `new` (see test_WrongArtFailsTheArtLaunch)
+        try new PlaceModules(pf) {
+            assertTrue(false, "modules over a corrupted collection");
+        } catch {}
     }
 
-    /// @dev The launch refuses art that isn't the exact code WorkerArtIndex was generated from (the renderer would
+    /// @dev The art launch refuses art that isn't the exact code WorkerArtIndex was generated from (the renderer would
     ///      draw nothing over it, every read checks the chunk's code hash): the chunks swapped, one with no code, or
-    ///      another data contract. It places nothing before it checks. The right order draws the new art.
-    function test_WrongArtFailsTheLaunch() public {
-        PlaceFrens pf = new PlaceFrens();
+    ///      another data contract. The right order draws the new art.
+    function test_WrongArtFailsTheArtLaunch() public {
         address a1 = address(new WorkerArt1());
         address a2 = address(new WorkerArt2());
         bytes[] memory other = new bytes[](1);
@@ -161,20 +163,17 @@ contract FrensLaunchFailuresTest is Test, FrensRules {
         // not vm.expectRevert over `new`: with forge's dynamic test linking a creation is a cheatcode call, and an
         // expected revert there ends the test early, before anything after it is checked
         for (uint256 i; i < wrong.length; ++i) {
-            try new PlaceModules(pf, wrong[i][0], wrong[i][1]) {
+            try new WorkerFrensRenderer(wrong[i][0], wrong[i][1]) {
                 assertTrue(false, "the launch took the wrong art");
             } catch (bytes memory err) {
-                assertEq(bytes4(err), Placer.PlaceFailed.selector, "PlaceFailed");
+                assertEq(bytes4(err), WorkerFrensRenderer.BadArt.selector, "BadArt");
             }
         }
-        assertEq(FrensPlan.SWAPPER_AT.code.length, 0, "a refused launch places nothing");
         // the right order draws the new art (the palettes need nothing from the swarm)
-        PlaceModules right = new PlaceModules(pf, a1, a2);
-        WorkerFrensRenderer r = WorkerFrensRenderer(right.renderer());
+        WorkerFrensRenderer r = new WorkerFrensRenderer(a1, a2);
         assertEq(r.art1(), a1);
         assertEq(r.art2(), a2);
         assertEq(r.palette(0).length, 1024);
-        assertGt(FrensPlan.SWAPPER_AT.code.length, 0, "the modules are placed");
     }
 
     /* ── ETH and repeats ───────────────────────────────────────── */
@@ -193,7 +192,7 @@ contract FrensLaunchFailuresTest is Test, FrensRules {
     }
 
     /// @dev A second launch on Ethereum finds everything placed and takes it as it is: the same frens, the same
-    ///      modules, their state untouched; only the renderer is new (its art chunks are new contracts)
+    ///      modules, their state untouched; only the art launch's contracts are new
     function test_SecondLaunchReusesWhatIsPlaced() public {
         LaunchRunner first = _run(makeAddr("first deployer"));
         IMD6900Frens f = IMD6900Frens(payable(first.placeFrens().frens()));
@@ -205,7 +204,7 @@ contract FrensLaunchFailuresTest is Test, FrensRules {
         assertEq(second.placeModules().swapper(), first.placeModules().swapper());
         assertEq(second.placeModules().minter(), first.placeModules().minter());
         assertEq(second.placeModules().gate(), first.placeModules().gate());
-        assertTrue(second.placeModules().renderer() != first.placeModules().renderer(), "a new renderer");
+        assertTrue(second.renderer() != first.renderer(), "a new renderer");
         assertTrue(f.mintOpen(), "the state of the first launch's frens is untouched");
         assertEq(f.owner(), OWNER);
     }
@@ -265,7 +264,7 @@ contract FrensLaunchFailuresTest is Test, FrensRules {
             d.art1(),
             d.art2(),
             pf.prices(),
-            pm.renderer()
+            d.renderer()
         ];
         for (uint256 i; i < actors.length; ++i) {
             address a = actors[i];
@@ -339,7 +338,7 @@ contract FrensLaunchFailuresTest is Test, FrensRules {
 
         // the team wallet's setup (script/frens/DeployFrens.s.sol setup()), call for call
         vm.startPrank(OWNER);
-        f.setRenderer(pm.renderer());
+        f.setRenderer(d.renderer());
         f.setModules(pm.swapper(), pm.gate());
         _rules(f, [uint16(1598), 312, 312]);
         f.sealTraits();
@@ -348,7 +347,7 @@ contract FrensLaunchFailuresTest is Test, FrensRules {
         vm.stopPrank();
         assertEq(id, 1);
         assertEq(f.ownerOf(1), FrensPlan.IMD6900);
-        assertEq(f.renderer(), pm.renderer());
+        assertEq(f.renderer(), d.renderer());
         assertEq(f.floorImd(), 0.6901e18 - 0.5e18, "the floor waits in $IMD: the real swapper has no pool here");
         assertEq(f.jobBudget(), 0.5e18);
         vm.expectRevert(WorkerFrensRenderer.BadArt.selector);

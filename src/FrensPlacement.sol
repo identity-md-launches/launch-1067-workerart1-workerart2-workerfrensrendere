@@ -3,7 +3,6 @@ pragma solidity ^0.8.26;
 
 import {FrensCode} from "./FrensCode.sol";
 import {FrensPlan} from "./FrensPlan.sol";
-import {WorkerArtIndex} from "./art/WorkerArtIndex.sol";
 
 /// @dev What PlaceModules reads of the swapper it placed (FrenSwapper)
 interface IPlacedSwapper {
@@ -36,9 +35,9 @@ abstract contract Placer {
     }
 }
 
-/// @title PlaceFrens - the IMD swarm's launch of Worker Frens, part one: the price table and the collection
-/// @dev The launch, in order: PlaceFrens, WorkerArt1, WorkerArt2 (src/art/WorkerArt.sol: the new art, as code), then
-///      PlaceModules.
+/// @title PlaceFrens - the IMD swarm's collection launch of Worker Frens, part one: the price table and the collection
+/// @dev The collection launch: PlaceFrens, then PlaceModules. The art launch, separately: WorkerArt1, WorkerArt2 (the
+///      new art, as code: src/art/WorkerArt.sol), then WorkerFrensRenderer over them.
 /// @notice Its constructor creates the frens' price curve (FrenPrices) and the collection (IMD6900Frens, named Worker
 ///         Frens) at FrensPlan's addresses (0x6900… for the frens), for the team wallet (owner and governor), with the
 ///         swarm's keeper and relayer. It calls nothing that existed before it but the CREATE2 deployer, and only if it is
@@ -71,27 +70,24 @@ contract PlaceFrens is Placer {
     }
 }
 
-/// @title PlaceModules - the IMD swarm's launch of Worker Frens, part four: the frens' swapper, minter, gate and renderer
+/// @title PlaceModules - the IMD swarm's collection launch of Worker Frens, part two: the frens' swapper, minter and gate
 /// @notice Its constructor creates, for the frens PlaceFrens placed: the floor's swapper (FrenSwapper, 0x6900…), the
-///         ETH mint (FrenMinter), the workers' and WL's window (FrenWorkerGate, the team wallet's) and the art
-///         (WorkerFrensRenderer, over the swarm's art already on chain and the two new chunks the launch deploys before
-///         this). The launch passes it PlaceFrens and the chunks (`$contract:PlaceFrens`, `$contract:WorkerArt1`,
-///         `$contract:WorkerArt2`). All but the renderer land at FrensPlan's addresses; the renderer's follows from the
-///         chunks' (read it here: `renderer()`).
-/// @dev It never wires the frens wrong. The two chunks must be the exact code WorkerArtIndex was generated from (the
-///      renderer would draw nothing otherwise): PlaceFailed. And a swapper it finds already placed at 0x6900… is taken
-///      only if its price average is the pool's price now (within 2x): otherwise the launch creates its own (a plain
-///      CREATE from this contract, so nobody can have put anything there), seeded at this block's price, and that one
-///      is the frens' swapper (`swapper()`), not FrensPlan.SWAPPER_AT.
+///         ETH mint (FrenMinter) and the workers' and WL's window (FrenWorkerGate, the team wallet's), at FrensPlan's
+///         addresses. The launch passes it PlaceFrens (`$contract:PlaceFrens`). The art (WorkerArt1, WorkerArt2 and
+///         WorkerFrensRenderer) is a launch of its own: every contract of a launch is created in one transaction, and
+///         the collection and its art together need more than EIP-7825's 2^24 gas. The team wallet points the frens at
+///         that launch's renderer (setup()).
+/// @dev It never wires the frens wrong: a swapper it finds already placed at 0x6900… is taken only if its price average
+///      is the pool's price now (within 2x); otherwise the launch creates its own (a plain CREATE from this contract,
+///      so nobody can have put anything there), seeded at this block's price, and that one is the frens' swapper
+///      (`swapper()`), not FrensPlan.SWAPPER_AT.
 contract PlaceModules is Placer {
     address public immutable frens;
     address public immutable swapper;
     address public immutable minter;
     address public immutable gate;
-    address public immutable renderer;
 
-    constructor(PlaceFrens placed, address art1, address art2) {
-        if (art1.codehash != _chunkHash(7) || art2.codehash != _chunkHash(8)) revert PlaceFailed();
+    constructor(PlaceFrens placed) {
         address f = placed.frens();
         frens = f;
         bytes memory init = abi.encodePacked(
@@ -118,7 +114,6 @@ contract PlaceModules is Placer {
             FrensPlan.GATE_SALT,
             abi.encodePacked(FrensCode.GATE, abi.encode(FrensPlan.OWNER, f, FrensPlan.IDENTITY, FrensPlan.IMD6900))
         );
-        renderer = _place(FrensPlan.RENDERER_SALT, abi.encodePacked(FrensCode.RENDERER, abi.encode(art1, art2)));
     }
 
     /// @dev The swapper's slow price average starts at the IMD6900/$IMD pool's price in the block that creates it, and
@@ -130,16 +125,5 @@ contract PlaceModules is Placer {
         uint256 avg = IPlacedSwapper(s).rateAverage();
         uint256 spot = IPlacedSwapper(s).spotRate();
         return avg * 2 >= spot && avg <= spot * 2;
-    }
-
-    /// @dev Chunk `c`'s code hash out of WorkerArtIndex's hex text (64 digits each), as the renderer reads it
-    function _chunkHash(uint256 c) internal pure returns (bytes32) {
-        bytes memory text = WorkerArtIndex.CHUNK_HASHES;
-        uint256 v;
-        for (uint256 k = c * 64; k < c * 64 + 64; ++k) {
-            uint256 d = uint8(text[k]);
-            v = v << 4 | (d < 0x3a ? d - 0x30 : d - 0x57);
-        }
-        return bytes32(v);
     }
 }

@@ -1,8 +1,9 @@
 # Worker Frens: deployed by the IMD swarm on Ethereum, at 0x6900…
 
 Worker Frens (wFREN) is a 2222-piece collection of on-chain pixel frens. Five AI agents build each one, layer by layer.
-This repository packs it so the IMD swarm can deploy the whole collection with IMD's `evm_contracts` launch: four
-contracts deployed through their constructors. The factory makes no initialization calls; the team wallet then
+This repository packs it so the IMD swarm can deploy the whole collection with two IMD `evm_contracts` launches, the
+collection and its art, five contracts deployed through their constructors. IMD creates a launch's contracts in one
+transaction, and both together need more than EIP-7825's 2^24 gas, so they launch separately. The factory makes no initialization calls; the team wallet then
 performs the setup described below before minting. The collection and its swapper land at addresses fixed in advance
 that start `0x6900`.
 
@@ -13,7 +14,7 @@ that start `0x6900`.
 | FrenMinter, minting with ETH | `0xBbb2796c9C54330788915990Ba36FDDe6dC198cF` |
 | FrenWorkerGate, the workers' and WL's window | `0x3F8d1553Cb71C8B5af013Ce985591d9B9BCD9ce2` |
 | FrenPrices, the price curve as code | `0x8f135B75Df156e6346c8525E138bC2BD652146ff` |
-| WorkerFrensRenderer, the art | follows from the launch's two art chunks (`PlaceModules.renderer()`) |
+| WorkerFrensRenderer, the art | the art launch's (it follows from IMD's deployer) |
 
 The addresses moved from the plan's first version when the launch review's fixes changed the collection's, the swapper's and
 the gate's code (`ADAPTATION.md` lists them); the price table's didn't change.
@@ -76,25 +77,29 @@ at `0x6900453d…` only if its average is the pool's price at the launch (within
 creates its own with a plain CREATE (nobody else can put anything at that address), seeded at the launch block's price,
 and that one is the frens' swapper: read `PlaceModules.swapper()`, which `setup()` does. The launch itself should go
 through a private relay, so nobody can push the price in the launch's own block. On a chain without the CREATE2 deployer
-(IMD's fresh-chain run) the launch creates the same contracts with its own CREATE2. `PlaceModules` also refuses to place
-the renderer over anything but the two exact art chunks (`PlaceFailed`): a renderer over other code would draw nothing.
+(IMD's fresh-chain run) the launch creates the same contracts with its own CREATE2. The renderer's constructor refuses
+anything but the two exact art chunks (`BadArt`): a renderer over other code would draw nothing.
 
-## The launch (`evm_contracts`, Ethereum, chain id 1)
+## The launches (`evm_contracts`, Ethereum, chain id 1)
 
-1. `PlaceFrens` (no constructor arguments): the price table and the collection, for the team wallet
-   `0x35dA9C0303507ddf708E87F2568EdDf12c47a059` (owner and governor).
-2. `WorkerArt1` (no constructor arguments): the first half of the new art, as its code.
-3. `WorkerArt2` (no constructor arguments): the second half.
-4. `PlaceModules`, with three arguments, `$contract:PlaceFrens`, `$contract:WorkerArt1`, `$contract:WorkerArt2`: the
-   swapper, the ETH minter, the gate and the renderer.
+Two launches, independent of each other (either may land first):
+
+- **The collection** (about 12.3M gas, all in):
+  1. `PlaceFrens` (no constructor arguments): the price table and the collection, for the team wallet
+     `0x35dA9C0303507ddf708E87F2568EdDf12c47a059` (owner and governor).
+  2. `PlaceModules`, with one argument, `$contract:PlaceFrens`: the swapper, the ETH minter and the gate.
+- **The art** (about 13.6M gas, all in):
+  1. `WorkerArt1` (no constructor arguments): the first half of the new art, as its code.
+  2. `WorkerArt2` (no constructor arguments): the second half.
+  3. `WorkerFrensRenderer`, with two arguments, `$contract:WorkerArt1`, `$contract:WorkerArt2`.
 
 ## After the launch (the team wallet)
 
-1. `setup()` points the collection at the launch's renderer, wires the swapper and the gate (both read from the launch's
-   `PlaceModules`), then sets and seals the trait rules. While the collection isn't an IMD6900 distributor yet (the
+1. `setup()` points the collection at the art launch's renderer, wires the swapper and the gate (both read from the
+   collection launch's `PlaceModules`), then sets and seals the trait rules. While the collection isn't an IMD6900 distributor yet (the
    batch below) it also pauses the floor's buys (`setParams(_, 0, 0)`): IMD6900 bought before that could never be paid
    out, and every `recycle` and `buyTreasury` would fail on it. The floor waits in $IMD meanwhile.
-   `MODULES=<the launch's PlaceModules> forge script script/frens/DeployFrens.s.sol --sig "setup()" --rpc-url … --account imdstr-deployer --broadcast`
+   `MODULES=<PlaceModules> RENDERER=<WorkerFrensRenderer> forge script script/frens/DeployFrens.s.sol --sig "setup()" --rpc-url … --account imdstr-deployer --broadcast`
 2. The WL: `gate.setWlRoot(root)`.
 3. The Ethereum timelock's batch for the new address (`script/frens/FrensTimelockBatch.s.sol`): the collection becomes
    an IMD6900 distributor and the swapper trades fee-free. Once it has landed, `resume()` (same script, same env) turns
@@ -113,14 +118,14 @@ the renderer over anything but the two exact art chunks (`PlaceFailed`): a rende
 - `test/FrensPlacement.t.sol`:
   - the code is the sources' own, and the plan follows from it;
   - the addresses are the same whoever deploys, and the launch deploys on a fresh chain;
-  - each launch contract fits IMD's limits:
+  - each launch fits one transaction whole, with 1M to spare (`test_EachLaunchFitsOneTransaction`): its creations,
+    its calldata at EIP-7623's rates, and IMD's launcher on top (300,000 + 7 gas a byte, above what two earlier
+    launches through it cost). Every initcode is within EIP-3860:
 
-    | | initcode | gas |
+    | launch | contracts (initcode) | gas, all in |
     |---|---|---|
-    | PlaceFrens | 40.8 KB | 9.3M |
-    | WorkerArt1 | 28.5 KB | 6.4M |
-    | WorkerArt2 | 21.9 KB | 4.9M |
-    | PlaceModules | 45.3 KB | 9.6M |
+    | the collection | PlaceFrens (40.8 KB), PlaceModules | 12.3M |
+    | the art | WorkerArt1 (28.5 KB), WorkerArt2 (21.9 KB), WorkerFrensRenderer (17.4 KB) | 13.6M |
   - IMD's admission scan is clean for every contract. The art chunks are framed (a PUSH32 byte before every 32 bytes),
     and the renderer keeps its index and code hashes as hex text;
   - every new art entry reads back as exactly `script/art/data`'s bytes, and other code at a chunk's address draws
