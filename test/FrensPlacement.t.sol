@@ -27,6 +27,25 @@ interface IOwned {
     function owner() external view returns (address);
 }
 
+interface ITimelockController {
+    function scheduleBatch(address[] calldata, uint256[] calldata, bytes[] calldata, bytes32, bytes32, uint256) external;
+    function executeBatch(address[] calldata, uint256[] calldata, bytes[] calldata, bytes32, bytes32) external payable;
+    function getMinDelay() external view returns (uint256);
+    function hashOperationBatch(address[] calldata, uint256[] calldata, bytes[] calldata, bytes32, bytes32)
+        external
+        pure
+        returns (bytes32);
+    function isOperationReady(bytes32) external view returns (bool);
+}
+
+interface IHookFees {
+    function feeAddress() external view returns (address);
+}
+
+interface IFeeExempt {
+    function feeExempt(address) external view returns (bool);
+}
+
 /// @dev What IMD's launch does with `evm_contracts`: the contracts in order from its own deployer, constructors only,
 ///      a later one given earlier ones' addresses (`$contract:PlaceFrens`, `$contract:WorkerArt1`, …), nothing called after
 contract ImdStyleDeployer {
@@ -552,6 +571,60 @@ contract FrensPlacementForkTest is Test, FrensRules {
         s.handover(frens);
         assertEq(frens.governor(), s.TIMELOCK());
         assertEq(frens.owner(), OWNER);
+    }
+
+    /// @dev The opening as it will run. The batch is queued with the addresses fixed ahead (here after the launch, the
+    ///      same call), the team wallet sets up, mints the curve's first frens to IMD6900 and hands the governor over;
+    ///      48h later the real TimelockController runs the batch: IMD6900 whitelists the frens, the swapper trades
+    ///      fee-free, the launch hook's fees come here, and the mint opens with the floor already buying IMD6900.
+    function test_fork_TheTimelockOpensTheMint() public {
+        FrensTimelockBatch b = new FrensTimelockBatch();
+        (address[] memory targets, uint256[] memory values, bytes[] memory datas) =
+            b.batch(FrensPlan.FRENS_AT, FrensPlan.SWAPPER_AT, true, true);
+        assertEq(targets.length, 4);
+        assertEq(targets[3], address(frens), "the last call opens these frens");
+        ITimelockController tl = ITimelockController(b.TIMELOCK());
+        uint256 delay = tl.getMinDelay();
+        assertEq(delay, 48 hours);
+        bytes32 salt = b.SALT();
+        vm.prank(OWNER); // a proposer
+        tl.scheduleBatch(targets, values, datas, bytes32(0), salt, delay);
+        bytes32 id = tl.hashOperationBatch(targets, values, datas, bytes32(0), salt);
+
+        // the team wallet: setup, the curve's first frens, the governor to the timelock
+        s.setup();
+        s.firstFrens(frens, minter, 6, 0.05 ether);
+        assertEq(frens.balanceOf(s.IMD6900()), 6);
+        s.handover(frens);
+        assertEq(frens.governor(), address(tl));
+        assertFalse(frens.mintOpen());
+
+        vm.warp(block.timestamp + delay - 1);
+        assertFalse(tl.isOperationReady(id), "not before 48h");
+        vm.prank(OWNER);
+        vm.expectRevert();
+        tl.executeBatch(targets, values, datas, bytes32(0), salt);
+        vm.warp(block.timestamp + 1);
+        assertTrue(tl.isOperationReady(id));
+        vm.prank(OWNER); // an executor
+        tl.executeBatch(targets, values, datas, bytes32(0), salt);
+
+        assertTrue(frens.mintOpen(), "open");
+        assertTrue(ITransferRule(s.IMD6900()).isDistributor(address(frens)), "an IMD6900 distributor");
+        assertTrue(IFeeExempt(b.PAIR_HOOK()).feeExempt(pm.swapper()), "the swapper trades fee-free");
+        assertEq(IHookFees(b.HOOK()).feeAddress(), address(frens), "the launch hook's fees come here");
+
+        // the first public minter (the gate's owner ends the workers' window here), the floor in IMD6900
+        vm.prank(OWNER);
+        gate.openPublic();
+        address buyer = makeAddr("a first minter");
+        vm.deal(buyer, 1 ether);
+        uint256 cost = frens.quote(1);
+        (uint256 ethIn,) = minter.quoteEth(1);
+        vm.prank(buyer);
+        minter.mintWithEth{value: ethIn * 102 / 100}(1, cost);
+        assertEq(frens.balanceOf(buyer), 1);
+        assertGt(frens.reserve(), 0, "the floor in IMD6900");
     }
 
     /// @dev The metadata names the fren as given, says nothing of IMD, and shows exactly `image`
