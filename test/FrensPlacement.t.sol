@@ -627,6 +627,73 @@ contract FrensPlacementForkTest is Test, FrensRules {
         assertGt(frens.reserve(), 0, "the floor in IMD6900");
     }
 
+    /// @dev Workers first, the public after the batch: the team wallet (still the governor) opens the workers' and WL's
+    ///      window as soon as the launch is set up, with floor buys paused so the floor waits in $IMD; 48h later the
+    ///      batch lands without touching the mint (no governor needed), buys come back on, the public opens, and the
+    ///      governor goes to the timelock
+    function test_fork_WorkersFirstThenPublic() public {
+        FrensTimelockBatch b = new FrensTimelockBatch();
+        (address[] memory targets, uint256[] memory values, bytes[] memory datas) =
+            b.batch(FrensPlan.FRENS_AT, FrensPlan.SWAPPER_AT, true, false);
+        assertEq(targets.length, 3, "no setMintOpen in it");
+        ITimelockController tl = ITimelockController(b.TIMELOCK());
+        bytes32 salt = b.SALT();
+        vm.prank(OWNER);
+        tl.scheduleBatch(targets, values, datas, bytes32(0), salt, 48 hours);
+
+        // day one: setup, the WL, floor buys paused, the window open
+        address wl = makeAddr("a WL wallet");
+        s.setup();
+        vm.startPrank(OWNER);
+        gate.setWlRoot(keccak256(bytes.concat(keccak256(abi.encode(wl, uint256(2)))))); // a one-wallet list: root = leaf
+        frens.setParams(1, 0, 0);
+        frens.setMintOpen(true);
+        vm.stopPrank();
+
+        // the WL wallet mints in the window with ETH; a wallet without credits can't
+        vm.prank(wl);
+        gate.claimWl(2, new bytes32[](0), wl);
+        vm.deal(wl, 2 ether);
+        deal(s.IMD(), wl, 70e18); // tier 2: two in one request
+        uint256 cost = frens.quote(2);
+        (uint256 ethIn,) = minter.quoteEth(2);
+        vm.prank(wl);
+        minter.mintWithEth{value: ethIn * 102 / 100}(2, cost);
+        assertEq(frens.balanceOf(wl), 2);
+        assertEq(gate.credits(wl), 0);
+        address pub = makeAddr("the public");
+        vm.deal(pub, 1 ether);
+        cost = frens.quote(1);
+        (ethIn,) = minter.quoteEth(1);
+        vm.prank(pub);
+        vm.expectRevert(abi.encodeWithSelector(FrenWorkerGate.NoCredit.selector, 0));
+        minter.mintWithEth{value: ethIn * 102 / 100}(1, cost);
+        assertEq(frens.reserve(), 0, "the floor waits in $IMD");
+        assertGt(frens.floorImd(), 0);
+
+        // +48h: the batch with the team wallet still the governor, buys back on, the public, the handover
+        vm.warp(block.timestamp + 48 hours);
+        vm.prank(OWNER); // an executor
+        tl.executeBatch(targets, values, datas, bytes32(0), salt);
+        assertTrue(ITransferRule(s.IMD6900()).isDistributor(address(frens)), "an IMD6900 distributor");
+        assertEq(IHookFees(b.HOOK()).feeAddress(), address(frens), "the launch hook's fees come here");
+        vm.startPrank(OWNER);
+        frens.setParams(1, 50e18, 0.25 ether);
+        gate.openPublic();
+        vm.stopPrank();
+        vm.roll(block.number + 2);
+        frens.buyFloor(0);
+        assertGt(frens.reserve(), 0, "the waiting $IMD now IMD6900");
+        cost = frens.quote(1);
+        (ethIn,) = minter.quoteEth(1);
+        vm.prank(pub);
+        minter.mintWithEth{value: ethIn * 102 / 100}(1, cost);
+        assertEq(frens.balanceOf(pub), 1, "the public mints");
+        s.handover(frens);
+        assertEq(frens.governor(), address(tl));
+        assertTrue(frens.mintOpen());
+    }
+
     /// @dev The metadata names the fren as given, says nothing of IMD, and shows exactly `image`
     function _checkMeta(string memory uri, string memory name, string memory image) internal pure {
         assertEq(_prefix(uri, 29), "data:application/json;base64,");
