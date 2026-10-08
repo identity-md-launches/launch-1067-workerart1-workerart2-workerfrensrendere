@@ -1,0 +1,9 @@
+The four contracts in `SwarmArtChunks.sol` are runtime fixtures for offline renderer tests. They are copied from `src/FrenArtChunks.sol` at [magic0xfrens/imd6900-frens-art revision 502dcb55d1211c4f07f79d7ac713c422f0090ae0](https://github.com/magic0xfrens/imd6900-frens-art/blob/502dcb55d1211c4f07f79d7ac713c422f0090ae0/src/FrenArtChunks.sol), which declares the MIT license. The contract bodies are unchanged; the header describes their use as fixtures.
+
+WorkerArtIndex references swarm chunks 1–4 for faces, hats and items. No current entry reads swarm chunks 5–7: the WorkerArt contracts supply the backgrounds and palettes. Each fixture contains its **entire** runtime, including unused layers and framing, because the renderer authenticates the whole code hash. Test setup verifies those hashes against WorkerArtIndex before installing the runtime at its Ethereum address.
+
+`WorkerArtOffline.t.sol` uses the production renderer and `script/art/data/expected.json` to check all seven revealed reference bitmaps and all three pending reference bitmaps, including their metadata wrappers. It also checks BMP format and row order, trait rejection, constructor behaviour, and hash validation after successful reads, corruption, removal and restoration. The tests require neither a fork nor a network connection. The existing fork suite remains the check against live Ethereum deployment state.
+
+`WorkerArtInvariants.t.sol` drives random payments and attempts to change configuration from three callers. It checks code, dependency and palette immutability, conservation of ETH sent to the STOP data contracts, and rejection of payments by the renderer. The existing collection invariant suite continues to cover reserves, job budgets, NFT balances and trait caps.
+
+Run the added suites with `forge test --offline --match-path 'test/WorkerArt*.t.sol'`. Fuzz counts and invariant depth are specified inline in the tests; no configuration changes are needed.
